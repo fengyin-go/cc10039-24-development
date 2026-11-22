@@ -71,6 +71,41 @@ npm run dev
 | 湖表血缘 | `lineage_graph` | 血缘关系 | 上游源、中间转换、下游消费 |
 | 治理报告 | `govern_report` | 治理报告 | 报告周期、治理指标、优化建议 |
 
+### 字段补数缺口（Schema 演进 ↔ 数据回填联动）
+
+回填检查点只能给出已处理条数，无法回答“某一列在哪些日期还缺数据”。
+`Schema演进` 每次对同列执行不兼容变更都会分配递增字段版本（v1、v2……），
+版本携带允许写入的列值和补数日期范围，执行变更时由回填服务逐日登记
+**字段补数缺口**（内存表 `backfill_gap`），并在补数写入后生成
+**补数记录**（内存表 `backfill_fill`）。
+
+- 缺口查询：按湖表、字段版本（元数据版本ID）、日期范围、缺口状态筛选待补部分；
+  每条缺口都带元数据版本ID和回填任务ID，可双向追溯。
+- 回填核算：Schema 演进用缺口查询结果核算下一次字段变更的回填输入，
+  返回待补天数、合并后的可执行日期范围与该版本允许写入的列值；
+  实际启动任务时只使用查询选中的日期范围和允许列值。
+- 幂等补数：同版本同日期重复提交已补完的日期会被拦截，只保留第一次完成的补数记录。
+- 同列两版变更：同一天可同时存在两个版本的缺口；新版本允许列值收窄后，
+  旧值写入会留痕并把缺口置为「待复核」，重叠日期复核页可查看每天各版本
+  写入了哪些字段数据、哪些值仍待复核。
+
+专用端点（路由见 `backend/app/routers/backfill.py`）：
+
+| 端点 | 用途 |
+| --- | --- |
+| `POST /api/backfill/field-changes` | 登记带补数范围与允许列值的不兼容字段变更草稿 |
+| `GET  /api/backfill/field-versions` | 查询同表同列的字段版本列表 |
+| `POST /api/backfill/gaps/query` | 字段补数缺口查询（湖表/版本/日期范围筛选） |
+| `POST /api/backfill/gaps/plan` | 核算下次字段变更关联的回填输入 |
+| `POST /api/backfill/gaps/start` | 按选中日期范围与允许列值启动回填任务 |
+| `POST /api/backfill/gaps/fill` | 提交单日补数（幂等，越界值转待复核） |
+| `POST /api/backfill/gaps/overlap-review` | 同列多版重叠日期写入/复核检查 |
+| `GET  /api/backfill/fills` | 补数记录查询（追溯版本与任务） |
+
+前端在「数据回填任务」之后新增 **字段补数缺口** 页面（`/backfill_gap`，
+`frontend/src/views/BackfillGapView.vue`），含缺口查询与补数、重叠日期复核、
+补数记录三个页签。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

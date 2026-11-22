@@ -2,12 +2,19 @@
 
 上游依赖快照版本模块提供变更前快照，下游联动回填任务进行存量数据迁移。
 兼容性检查是核心：变更类型与兼容级别必须匹配，不兼容变更需要回填。
+
+字段版本化：
+    同一湖表同一字段每次成功执行的不兼容变更都会分配一个递增字段版本号，
+    版本携带「允许写入的列值」和需要补数的日期范围。执行变更时把这些信息
+    交给回填服务登记字段补数缺口，作为下一次字段变更关联的回填输入。
 """
 from __future__ import annotations
 
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.backfill_job import BackfillJobService
+from app.services.date_utils import daterange
 from app.store import store
 
 
@@ -28,6 +35,47 @@ class SchemaEvolutionService(BaseModuleService):
     STATUS_ORDER = ["草稿", "待审批", "已执行", "已回滚"]
     ACTION_RULES = {"提交审批": "待审批", "执行变更": "已执行"}
     NEGATIVE_ACTIONS = []
+
+    def create_field_change(
+        self,
+        *,
+        table_name: str,
+        column_name: str,
+        change_type: str,
+        allowed_values: list[str],
+        backfill_start: str,
+        backfill_end: str,
+        snapshot_ref: str = "",
+    ) -> tuple[dict[str, Any] | None, str]:
+        """登记一次带字段版本补数信息的不兼容 Schema 变更。"""
+        table_name = (table_name or "").strip()
+        column_name = (column_name or "").strip()
+        if not table_name or not column_name:
+            return None, "湖表名和变更字段不能为空"
+        if not allowed_values:
+            return None, "不兼容变更必须声明新版本允许写入的列值"
+        try:
+            daterange(backfill_start, backfill_end)
+        except ValueError as exc:
+            return None, str(exc)
+
+        entry, missing = self.create_entry({
+            "湖表名": table_name,
+            "变更类型": change_type or "修改字段类型",
+            "变更字段": column_name,
+            "兼容级别": "不兼容",
+            "变更前快照": snapshot_ref,
+        })
+        if entry is None:
+            return None, f"缺少必填字段：{'、'.join(missing)}"
+        entry["允许列值"] = list(allowed_values)
+        entry["回填起始日期"] = backfill_start
+        entry["回填结束日期"] = backfill_end
+        entry["字段版本"] = None
+        return entry, (
+            f"Schema 变更草稿已登记：{table_name}.{column_name}，"
+            f"补数范围 {backfill_start}~{backfill_end}"
+        )
 
     def submit_approval(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
         """提交审批：执行兼容性检查。"""
@@ -81,12 +129,14 @@ class SchemaEvolutionService(BaseModuleService):
         table_name = entry.get("湖表名", "")
         change_type = entry.get("变更类型", "")
         compat_level = entry.get("兼容级别", "")
+        column_name = entry.get("变更字段", "")
 
         # 自身状态流转
         entry["status"] = "已执行"
         entry["pending"] = False
         entry["abnormal"] = False
 
+        gap_message = ""
         # 如果是不兼容变更，触发回填任务
         if compat_level == "不兼容":
             backfill_jobs = store.find_by_field("backfill_job", "目标湖表", table_name)
@@ -95,11 +145,30 @@ class SchemaEvolutionService(BaseModuleService):
                     if bj.get("status") == "待调度":
                         bj["pending"] = True
 
+            # 带补数范围的不兼容变更：分配字段版本并登记字段补数缺口
+            start_date = entry.get("回填起始日期")
+            end_date = entry.get("回填结束日期")
+            allowed_values = list(entry.get("允许列值", []) or [])
+            if start_date and end_date and allowed_values:
+                version_label = self._next_field_version(table_name, column_name)
+                entry["字段版本"] = version_label
+                backfill_svc = BackfillJobService()
+                _, gap_message = backfill_svc.register_gaps(
+                    table_name=table_name,
+                    column_name=column_name,
+                    version_id=entry_id,
+                    version_label=version_label,
+                    allowed_values=allowed_values,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+
             store.log_event("schema_to_backfill", "schema_evolution", "backfill_job", {
                 "entry_id": entry_id,
                 "table_name": table_name,
                 "change_type": change_type,
                 "compat_level": compat_level,
+                "field_version": entry.get("字段版本"),
                 "affected_jobs": len(backfill_jobs),
             })
 
@@ -109,7 +178,10 @@ class SchemaEvolutionService(BaseModuleService):
             "change_type": change_type,
         })
 
-        return entry, f"Schema 变更 {table_name} - {change_type} 已执行"
+        message = f"Schema 变更 {table_name} - {change_type} 已执行"
+        if gap_message:
+            message = f"{message}；{gap_message}"
+        return entry, message
 
     def rollback_change(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
         """回滚 Schema 变更：恢复到变更前快照。"""
@@ -142,9 +214,24 @@ class SchemaEvolutionService(BaseModuleService):
         entry["abnormal"] = True
         return entry, f"Schema 变更已回滚（快照 {snapshot_ref} 无法精确恢复）"
 
+    def list_field_versions(self, table_name: str, column_name: str) -> list[dict[str, Any]]:
+        """查询同表同列的全部字段版本，按版本序号排序。"""
+        versions = [
+            row for row in store.rows(self.MODULE)
+            if row.get("湖表名") == table_name
+            and row.get("变更字段") == column_name
+            and row.get("字段版本")
+        ]
+        return sorted(versions, key=lambda row: row["id"])
+
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         if action == "提交审批":
             return self.submit_approval(entry_id)
         if action == "执行变更":
             return self.execute_change(entry_id)
         return super().run_action(entry_id, action)
+
+    def _next_field_version(self, table_name: str, column_name: str) -> str:
+        """同表同列每执行一次不兼容变更，字段版本号递增（v1、v2……）。"""
+        existing = self.list_field_versions(table_name, column_name)
+        return f"v{len(existing) + 1}"
